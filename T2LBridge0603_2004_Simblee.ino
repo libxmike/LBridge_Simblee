@@ -2765,4 +2765,3 @@ int print_packet(Dexcom_packet* pPkt)
 }
 
 /* ************************ end of LBridge code **************** */
-  
