@@ -15,6 +15,15 @@ GPIO 6    SS
 +3V       VDD/SSO
 GND       GND
 
+| Simblee      | BM019  |
+| ------------ |:------:|
+| GPIO 2       | DIN    |
+| GPIO 3       | MISO   |
+| GPIO 4       | SCK    |
+| GPIO 5       | MOSI   |
+| GPIO 6       | SS     |
+| +3V          | VDD/SSO|
+| GND          | GND    |
 
 Simblee programming pins
 GND
