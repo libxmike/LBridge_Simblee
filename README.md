@@ -25,4 +25,4 @@ Simblee programming pins
 | GPIO 0 / AREF|
 | GPIO 1       |
 
-+3V is optional, works w/o if Simblee is powered with LiPo while programming, this way you can youe just 4 wires.
++3V is optional, works w/o if Simblee is powered with LiPo while programming, this way you can you can use just 4 wires.
