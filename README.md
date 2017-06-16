@@ -15,7 +15,6 @@ GPIO 6    SS
 +3V       VDD/SSO
 GND       GND
 
-
 Simblee programming pins
 GND
 RESET
