@@ -18,11 +18,11 @@ pin mapping:
 
 Simblee programming pins
 
-| Simblee      |
-| ------------ |
-| GND          |
-| RESET        |
-| GPIO 0 / AREF|
-| GPIO 1       |
+| Simblee      | Programmer   |    
+| ------------ | :-----------|
+| GND          |GND          |
+| RESET        |RESET |
+| GPIO 0 / AREF|TXD 0 |
+| GPIO 1       |TXD 1 |
 
 +3V is optional, works w/o if Simblee is powered with LiPo while programming, this way you can you can use just 4 wires.
