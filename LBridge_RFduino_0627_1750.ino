@@ -1,16 +1,50 @@
+/*
+ * LBridge for RFduino / Simblee
+ * 
+ * LBridge running on RFduino or Simblee platform (aka Transmiter2 from @MarekMacner)
+ * 
+ * Reads every 5 min a Libre Freestyle sensor via NFC and transmit the BG readings to xDrip+ via BLE.
+ * Supports backfilling of older BG readings which were not transfered at the time of reading.
+ * 
+ * Code used from the work of @UPetersen, @MarekMacner, @jstevensog, @savek-cc and @bertrooode
+ * 
+ * keencave, 20.6.2017
+ * 
+ * ToDo: 
+ *  - optimize BLE reconnect
+ *  - only read changed NFC blocks from sensor for better battery performance
+ *  - enable "hidden" power modes on BM019
+ */
 
-/* DrippyT2 by Marek Macner (c) 2017 */
-#define DEBUG
-#define DEBUGM
-//#define DEBUGX
-#define N_DNFC
+/* 
+ * program configuration 
+ */
 
-#define N_T2
+#define RFD                     // RFduino or Simblee platform?
+#define USE_DEAD_SENSOR         // we can test with a dead sensor
 
+#define N_SHOW_LIMITTER         // show original Limitter output
+#define N_DYNAMIC_TXID          // get TXID automatically
+#define N_XBEXT                 // xbridge+ code
+#define N_T2                    // T2 Transmiter from Marek?
+
+// length of device name and advertisement <=15!!!
+#define LB_NAME   "xbridge0"    // dont change "xbridge", space for 1 char left to indicate different versions
+#define LB_ADVERT "rfduino"     // dont change "rfduino"
+#define LB_VERSION "0627_1750"
+
+#ifdef RFD
 #include <RFduinoBLE.h>
+#else
+#include <SimbleeBLE.h>
+#endif
+
 #include <SPI.h>
 #include <Stream.h>
+#include <Memory.h>
+#ifdef XBEXT
 #include "xbridge_libre.h"
+#endif
 
 #define PIN_SPI_SCK   4
 #define PIN_SPI_MOSI  5
@@ -23,31 +57,20 @@
 #define SYSTEM_INFORMATION_DATA 0x2002
 #define BATTERY_DATA 0x2005
 
-/* ------------------ VWI variables ----------- */
-
-// length of device name and advertisement <=15!!!
-#define LB_NAME  "xbridge"
-#define LB_VERSION  "0603_2004"
-
-#define N_SHOW_LIMITTER       // show original Limitter output
-#define USE_DEAD_SENSOR       // we can test with a dead sensor
-#define N_SEND_ERROR_COUNTERS // send error counter values via BLE
-#define N_DYNAMIC_TXID        // get TXID automatically
-#define N_XBEXT                 // xbridge extended code
+/* ------------------ program variables ----------- */
 
 #define MIN_VOLTAGE 2100
 //#define MAX_VOLTAGE 3200
-#define MAX_VOLTAGE 3600
+#define MAX_VOLTAGE 3600            // adjust voltage measurement to have a wider rrange
 
-unsigned long loop_cnt = 0;
-
+unsigned long loop_cnt = 0;         // count the 5 mins loops
 static boolean show_ble = 1;        // what is shown in serial monitor
 static boolean show_state = 1;      // show print_state() infos, disabled ftm
-int ble_answer;                     // char from BLE reeived?
+int ble_answer;                     // state counter, char from BLE reeived?
 
-#define BLEBUFLEN 80
+#define BLEBUFLEN 80                // BLE input buffer
 unsigned char bleBuf[BLEBUFLEN];
-int bleBufRi = 0;
+int bleBufRi = 0;                   // BLE read and write index
 int bleBufWi = 0;
 
 // defines the xBridge protocol functional level.  Sent in each packet as the last byte.
@@ -61,7 +84,7 @@ static volatile boolean got_drp;          // DataRequestPacket
 static volatile boolean dex_tx_id_set;    // indicates if the Dexcom Transmitter id (settings.dex_tx_id) has been set.  Set in doServices.
 static volatile boolean ble_connected;    // bit indicating the BLE module is connected to the phone.  Prevents us from sending data without this.
 
-static volatile boolean got_ok = 0;         // flag indicating we got OK from the HM-1x
+static volatile boolean got_ok = 0;       // flag indicating we got OK from the HM-1x
 static unsigned long last_ble_send_time;
 static boolean crlf_printed = 0;
 
@@ -129,7 +152,7 @@ _QuarterPacket1 qpkt1;
 _QuarterPacket2 qpkt2;
 #endif
 
-/* ------------- endof VWI variables ---------- */
+/* ------------- endof program veriables ---------- */
 
 typedef struct  __attribute__((packed))
 {
@@ -169,7 +192,7 @@ typedef struct  __attribute__((packed))
   double temperatureC;
   double temperatureF;
   double rssi;
-} RFDuinoDataType;
+} SoCDataType;
 
 typedef struct  __attribute__((packed))
 {
@@ -205,7 +228,6 @@ extern void UBP_didAdvertise(bool start) __attribute__((weak));
 extern void UBP_didConnect() __attribute__((weak));
 extern void UBP_didDisconnect() __attribute__((weak));
 
-
 byte resultBuffer[40];
 byte dataBuffer[400];
 byte NFCReady = 0;            // 0 - not initialized, 1 - initialized, no data, 2 - initialized, data OK
@@ -214,7 +236,9 @@ bool sensorDataOK = false;
 IDNDataType idnData;
 SystemInformationDataType systemInformationData;
 SensorDataDataType sensorData;
-RFDuinoDataType rfduinoData;
+
+SoCDataType SoCData;        // store processor variables
+
 struct dataConfig valueSetup;
 dataConfig *p;
 AllBytesDataType allBytes;
@@ -248,28 +272,27 @@ void setup()
 {
   p = (dataConfig*)ADDRESS_OF_PAGE(MY_FLASH_PAGE);
   Serial.begin(9600);
-
   delay(2000);    // give serial interface time to settle
+
   Serial.print("\r\n=== loop #"); Serial.print(loop_cnt);
   Serial.print(" =====================================================================================================");
   print_state("setup()");
-
   print_state(" ------------------------------------------------------------------");
   print_state(" --- LBridge starting ---");
   print_state(" --- BLE Name: "); Serial.print(LB_NAME); Serial.print(" ---");
   print_state(" --- Version: "); Serial.print(LB_VERSION); Serial.print(" ---");
-//  print_state(" --- avail. mem: ")); Serial.print(freeMemory()); Serial.print(F(" ---");
-  print_state(" --- queue size "); Serial.print(DXQUEUESIZE);
+  print_state(" --- RAM used: "); Serial.print(ramUsed()); Serial.print(", Flash used: "); Serial.print(flashUsed()); Serial.print(" ---");
+  print_state(" --- Queue size: "); Serial.print(DXQUEUESIZE);
   print_state(" ------------------------------------------------------------------");
 
   print_state("setup - start - ");
 
-  RfduinoData();
+  SoC_Data();
   setupInitData();
   protocolType = p->protocolType;
   runPeriod = p->runPeriod;
 
-//  runPeriod = 1;
+//  runPeriod = 1;          // loop time is 1 min, only for test
 
   setupBluetoothConnection();
   nfcInit();
@@ -283,13 +306,9 @@ void setup()
   delay(1);
   // ====== changed by Bert Roode
 
-#ifdef DEBUG
-  print_state("NFCReady = ");
-  Serial.print(NFCReady);
-  Serial.print(", BatOK = ");
-  Serial.print(BatteryOK);
+  print_state("NFCReady = "); Serial.print(NFCReady);
+  Serial.print(", BatOK = "); Serial.print(BatteryOK);
   print_state("setup - end - ");
-#endif
 
   // init xbridge queue
   Pkts.read = 0;
@@ -299,54 +318,49 @@ void setup()
 
 void loop()
 {
-  Serial.print("\r\n=== loop #"); Serial.print(++loop_cnt);
-  Serial.print(" === BT status "); Serial.print(BTconnected);
-  Serial.print(" ==="); Serial.printf(" RSSI: %f", rfduinoData.rssi);
+  Serial.print("\r\n=== loop #"); Serial.print(++loop_cnt); Serial.print(" === BT status "); Serial.print(BTconnected);
+  Serial.print(" ==="); Serial.printf(" RSSI: %f", SoCData.rssi);
   Serial.print(" =================================================");
-  print_state("loop - start - BLE Name: ");
-  Serial.print(LB_NAME); Serial.print(" ");
-  Serial.print("Version: "); Serial.print(LB_VERSION);
+  print_state("loop - start - BLE Name: "); Serial.print(LB_NAME); Serial.print(", Version: "); Serial.print(LB_VERSION);
+  Serial.print(", Platform: "); 
+#ifdef RFD
+  Serial.print("RFduino");
+#else
+  Serial.print("Simblee");
+#endif
 
   // ====== change by Bert Roode
   time_loop_started = millis();
   // ====== end change by Bert Roode
   
-  if (BatteryOK)
-  {
+  if (BatteryOK) {
     readAllData();
-    if (NFCReady == 2)
-    {
-#ifdef DEBUG
+    if (NFCReady == 2) {
       print_state("After sensor read, NFCReady = ");
       Serial.print(NFCReady);
-#endif
       dataTransferBLE();
     }
-    else
-    {
-#ifdef DEBUG
+    else {
       print_state("No sensor data, ");
       Serial.print("NFCReady = ");
       Serial.print(NFCReady);
-#endif
     }
   }
-  else
-  {
-#ifdef DEBUG
+  else {
     print_state("low Battery - go sleep");
-#endif
   }
-#ifdef DEBUG
   print_state("loop - end - ");
   Serial.print(" NFCReady = ");
   Serial.print(NFCReady);
-#endif
    // ====== start change by Bert Roode
   time_elapsed = millis() - time_loop_started;
   print_state("sleep for ");
   Serial.print(60000 * runPeriod);
+#ifdef RFD
   RFduino_ULPDelay((60000 * runPeriod) - time_elapsed) ;
+#else
+  Simblee_ULPDelay((60000 * runPeriod) - time_elapsed) ;
+#endif
   
 //  restartWDT();
    // ====== end change by Bert Roode
@@ -359,26 +373,20 @@ void dataTransferBLE()
   if ( BTconnected )
     print_state("we are connected - transfer data ...");
   else
-    print_state("dataTransferBLE(), wait 40 s for connect ...");
-  for (int i = 0; i < 40; i++)
-  {
-    if (BTconnected)
-    {
-      if (protocolType == 1) forLimiTTer();
+    print_state("dataTransferBLE(), wait 40 s for BLE connect ...");
+  for (int i = 0; i < 40; i++) {
+    if (BTconnected) {
+      if (protocolType == 1)      forLimiTTer();
       else if (protocolType == 2) forTransmiter1();
       else if (protocolType == 3) forTransmiter2();
       else if (protocolType == 4) forLibreCGM();
       break;
     }
-    else
-    {
-#ifdef DEBUGM
+    else {
       //        Serial.print("Not connected after ");
       //        Serial.println(i);
       //        Serial.printf("not connected after %d\rn", i);
-#endif
       waitDoingServices(1000, 1);
-      //      delay(1000);
     }
   }
   NFCReady = 1;
@@ -388,6 +396,7 @@ void dataTransferBLE()
 void setupBluetoothConnection()
 {
   print_state("setupBluetoothConnection() - ");
+#ifdef RFD
   if (protocolType == 1) RFduinoBLE.deviceName = LB_NAME;
   else if (protocolType == 2) RFduinoBLE.deviceName = "LimiTTer";
   else if (protocolType == 3) RFduinoBLE.deviceName = "Transmiter";
@@ -395,18 +404,28 @@ void setupBluetoothConnection()
   Serial.print(" - setting Transmiter device");
   RFduinoBLE.advertisementData = "data";
   RFduinoBLE.customUUID = "c97433f0-be8f-4dc8-b6f0-5343e6100eb4";
-#else
+#else /* T2 */
   // emulate a HM-11 module to be recognized like a LimiTTer running LBridge code
   Serial.print(" - setting LimiTTer/xbridge device");
-  RFduinoBLE.advertisementData = "rfduino";
+  RFduinoBLE.advertisementData = LB_ADVERT;
   RFduinoBLE.customUUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
-#endif
+#endif /* T2 */
   RFduinoBLE.advertisementInterval = MILLISECONDS(300);
   RFduinoBLE.txPowerLevel = 4;
   RFduinoBLE.begin();
-#ifdef DEBUGM
-  Serial.print("done");
+#else /* RFD */
+  if (protocolType == 1) SimbleeBLE.deviceName = LB_NAME;
+  else if (protocolType == 2) SimbleeBLE.deviceName = "LimiTTer";
+  else if (protocolType == 3) SimbleeBLE.deviceName = "Transmiter";
+  // emulate a HM-11 module to be recognized like a LimiTTer running LBridge code
+  Serial.print(" - setting LimiTTer/xbridge device");
+  SimbleeBLE.advertisementData = LB_ADVERT;
+  SimbleeBLE.customUUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
+  SimbleeBLE.advertisementInterval = MILLISECONDS(300);
+  SimbleeBLE.txPowerLevel = 4;
+  SimbleeBLE.begin();
 #endif
+  Serial.print(" - done");
 }
 /* ************ BLE ********************* */
 
@@ -414,9 +433,7 @@ void setupBluetoothConnection()
 //============================================================================================================
 void NFC_wakeUP()
 {
-#ifdef DEBUGM
   print_state("NFC_wakeUp() - Send wake up pulse to CR95HF and configure to use SPI - ");
-#endif
   digitalWrite(PIN_IRQ, HIGH);
   delay(10);
   digitalWrite(PIN_IRQ, LOW);
@@ -431,8 +448,11 @@ void NFC_CheckWakeUpEventRegister()
   byte command[length];
 
   print_state("NFC_CheckWakeUpEventRegister()");
-
+#ifdef RFD
   while ( RFduinoBLE.radioActive );
+#else
+  while ( SimbleeBLE.radioActive );
+#endif
 
   command[ 0] = 0x08;
   command[ 1] = 0x03;
@@ -445,16 +465,7 @@ void NFC_CheckWakeUpEventRegister()
 }
 void send_NFC_PollReceive(byte *command, int commandLength)
 {
-  //#ifdef DNFC
 //  print_state("send_NFC_PollReceive() - ");
-  //#endif
-#ifdef DNFC
-  int i;
-  for ( i = 0 ; i < commandLength ; i++ ) {
-    Serial.print(command[i], HEX);
-    Serial.print(" ");
-  }
-#endif
   send_NFC_Command(command, commandLength);
   poll_NFC_UntilResponsIsReady();
   receive_NFC_Response();
@@ -463,19 +474,7 @@ void send_NFC_PollReceive(byte *command, int commandLength)
 #define NFCTIMEOUT 500
 void new_send_NFC_PollReceive(byte *command, int commandLength)
 {
-#ifdef DNFC
-  print_state("send_NFC_PollReceive() - ");
-#endif
-#ifdef DNFC
-  int i;
-  for ( i = 0 ; i < commandLength ; i++ ) {
-    Serial.print(command[i], HEX);
-    Serial.print(" ");
-  }
-#endif
-#ifdef DNFC
-  print_state("send_NFC_Command()");
-#endif
+//  print_state("send_NFC_PollReceive() - ");
   digitalWrite(PIN_SPI_SS, LOW);
   SPI.transfer(0x00);
   for (int i = 0; i < commandLength; i++)
@@ -487,16 +486,12 @@ void new_send_NFC_PollReceive(byte *command, int commandLength)
 
   unsigned long ms = millis();
   byte rb;
-#ifdef DNFC
-  print_state("poll_NFC_UntilResponsIsReady() - ");
-#endif
+//  print_state("poll_NFC_UntilResponsIsReady() - ");
   digitalWrite(PIN_SPI_SS , LOW);
   while ( (resultBuffer[0] != 8) && ((millis() - ms) < NFCTIMEOUT) )
   {
     rb = resultBuffer[0] = SPI.transfer(0x03);
-#ifdef DEBUGX
-    Serial.printf("SPI polling response byte:%x\r\n", resultBuffer[0]);
-#endif
+//    Serial.printf("SPI polling response byte:%x\r\n", resultBuffer[0]);
     resultBuffer[0] = resultBuffer[0] & 0x08;
   }
   digitalWrite(PIN_SPI_SS, HIGH);
@@ -505,14 +500,6 @@ void new_send_NFC_PollReceive(byte *command, int commandLength)
     Serial.print("\r\n *** poll timeout *** -> response ");
     Serial.print(rb);
   }
-#ifdef DNFC
-  else
-    Serial.print("done");
-#endif
-
-#ifdef DNFC
-  print_state("receive_NFC_Response() - ");
-#endif
   digitalWrite(PIN_SPI_SS, LOW);
   SPI.transfer(0x02);
   resultBuffer[0] = SPI.transfer(0);
@@ -520,32 +507,15 @@ void new_send_NFC_PollReceive(byte *command, int commandLength)
   for (byte i = 0; i < resultBuffer[1]; i++) resultBuffer[i + 2] = SPI.transfer(0);
   digitalWrite(PIN_SPI_SS, HIGH);
   delay(1);
-  /*
-    for ( i = 0 ; resultBuffer[1] ; i++ ) {
-      Serial.print(resultBuffer[i], HEX);
-      Serial.print(" ");
-    }
-  */
   Serial.print("done");
 }
 
 //============================================================================================================
 void send_NFC_Command(byte *commandArray, int length)
 {
-#ifdef DNFC
-  print_state("send_NFC_Command() - ");
-#endif
-#ifdef DNFC
-  int j;
-  for ( j = 0 ; j < length ; j++ ) {
-    Serial.print(commandArray[j], HEX);
-    Serial.print(" ");
-  }
-#endif
   digitalWrite(PIN_SPI_SS, LOW);
   SPI.transfer(0x00);
-  for (int i = 0; i < length; i++)
-  {
+  for (int i = 0; i < length; i++) {
     SPI.transfer(commandArray[i]);
   }
   digitalWrite(PIN_SPI_SS, HIGH);
@@ -556,16 +526,12 @@ void poll_NFC_UntilResponsIsReady()
 {
   unsigned long ms = millis();
   byte rb;
-#ifdef DNFC
-  print_state("poll_NFC_UntilResponsIsReady() - ");
-#endif
+//  print_state("poll_NFC_UntilResponsIsReady() - ");
   digitalWrite(PIN_SPI_SS , LOW);
   while ( (resultBuffer[0] != 8) && ((millis() - ms) < NFCTIMEOUT) )
   {
     rb = resultBuffer[0] = SPI.transfer(0x03);
-#ifdef DEBUGX
-    Serial.printf("SPI polling response byte:%x\r\n", resultBuffer[0]);
-#endif
+//    Serial.printf("SPI polling response byte:%x\r\n", resultBuffer[0]);
     resultBuffer[0] = resultBuffer[0] & 0x08;
   }
   digitalWrite(PIN_SPI_SS, HIGH);
@@ -574,16 +540,12 @@ void poll_NFC_UntilResponsIsReady()
     Serial.print("\r\n *** poll timeout *** -> response ");
     Serial.print(rb);
   }
-#ifdef DNFC
-  else
-    Serial.print("done");
-#endif
+//  else
+//    Serial.print("done");
 }
 void receive_NFC_Response()
 {
-#ifdef DNFC
-  print_state("receive_NFC_Response()");
-#endif
+//  print_state("receive_NFC_Response()");
   digitalWrite(PIN_SPI_SS, LOW);
   SPI.transfer(0x02);
   resultBuffer[0] = SPI.transfer(0);
@@ -595,7 +557,6 @@ void receive_NFC_Response()
 //============================================================================================================
 void print_NFC_WakeUpRegisterResponse()
 {
-#ifdef DEBUGM
   print_state("print_NFC_WakeUpRegisterResponse() - ");
   Serial.printf("Result code (byte 0): %x", resultBuffer[0]);
   Serial.printf(", Length of data (byte 1): %d", resultBuffer[1]);
@@ -607,16 +568,13 @@ void print_NFC_WakeUpRegisterResponse()
     }
   }
   //    print_state("... finished printing wake-up register result.");
-#endif
 }
 //============================================================================================================
 void SetNFCprotocolCommand()
 {
   for (int t = 0; t < 9; t++)
   {
-    //#ifdef DNFC
     print_state("SetNFCprotocolCommand() - ");
-    //#endif
     int length = 4;
     byte command[length];
     command[ 0] = 0x02;
@@ -633,21 +591,17 @@ void SetNFCprotocolCommand()
     }
     if ((resultBuffer[0] == 0) & (resultBuffer[1] == 0))
     {
-#ifdef DEBUG
       Serial.print("Try=");
       Serial.print(t);
       Serial.print(" PROTOCOL SET - OK");
-#endif
       NFCReady = 1;
       break;
     }
     else
     {
-#ifdef DEBUG
       Serial.print("Try=");
       Serial.print(t);
       Serial.print(" BAD RESPONSE TO SET PROTOCOL");
-#endif
       NFCReady = 0; // NFC not ready
     }
   }
@@ -660,9 +614,7 @@ void runIDNCommand(int maxTrials)
   command[0] = 0x01;
   command[1] = 0x00;
   delay(10);
-#ifdef DEBUG
   Serial.printf("maxTrials: %d, RXBuffer[0]: %x", maxTrials, resultBuffer[0]);
-#endif
   runIDNCommandUntilNoError(command, sizeof(command), maxTrials);
 }
 
@@ -673,28 +625,20 @@ void runIDNCommandUntilNoError(byte *command, int length, int maxTrials)
 //  print_state("runIDNCommandUntilNoError() - ");
   do
   {
-#ifdef DEBUGM
     Serial.printf("Before: Count: %d, success: %b, resultBuffer[0]: %x", count, success, resultBuffer[0]);
-#endif
     count++;
     memset(resultBuffer, 0, sizeof(resultBuffer));
     send_NFC_PollReceive(command, sizeof(command));
     success = idnResponseHasNoError();
-#ifdef DEBUGM
     Serial.printf("\r\nAfter: Count: %d, success: %b, resultBuffer[0]: %x", count, success, resultBuffer[0]);
-#endif
   } while ( !success && (count < maxTrials));
   delay(10);
-#ifdef DEBUGM
   Serial.printf("Exiting at count: %d, resultBuffer[0]: %x", count, resultBuffer[0]);
-#endif
 }
 bool idnResponseHasNoError()
 {
   print_state("idnResponseHasNoError() - ");
-#ifdef DEBUG
   Serial.printf("IDN response is resultBuffer[0]: %x", resultBuffer[0]);
-#endif
   if (resultBuffer[0] == 0x00)
   {
     return true;
@@ -715,7 +659,6 @@ IDNDataType idnDataFromIDNResponse()
 void printIDNData(IDNDataType idnData)
 {
   print_state("printIDNData() - ");
-#ifdef DEBUGM
   String nfc = "";
   //    Serial.println("Printing IDN data:");
   Serial.printf("Result code: %x", idnData.resultCode);
@@ -732,24 +675,19 @@ void printIDNData(IDNDataType idnData)
   Serial.print(nfc);
   Serial.printf(", NFC Device CRC  %x:%x", idnData.romCRC[0], idnData.romCRC[1] );
   //    Serial.println("");
-#endif
 }
 //============================================================================================================
 void runSystemInformationCommandUntilNoError(int maxTrials)
 {
   memset(resultBuffer, 0, sizeof(resultBuffer));
-#ifdef DEBUGX
-  Serial.printf("maxTrials: %d, resultBuffer[0]: %x \r\n", maxTrials, resultBuffer[0]);
-#endif
+//  Serial.printf("maxTrials: %d, resultBuffer[0]: %x \r\n", maxTrials, resultBuffer[0]);
   byte command[4];
   command[0] = 0x04;
   command[1] = 0x02;
   command[2] = 0x03;
   command[3] = 0x2B;
   delay(10);
-#ifdef DEBUGX
-  Serial.printf("maxTrials: %d, resultBuffer[0]: %x \r\n", maxTrials, resultBuffer[0]);
-#endif
+//  Serial.printf("maxTrials: %d, resultBuffer[0]: %x \r\n", maxTrials, resultBuffer[0]);
   runNFCcommandUntilNoError(command, sizeof(command), maxTrials);
 }
 void runNFCcommandUntilNoError(byte *command, int length, int maxTrials)
@@ -760,26 +698,19 @@ void runNFCcommandUntilNoError(byte *command, int length, int maxTrials)
   do
   {
     delay(1);
-#ifdef DEBUGX
-    Serial.printf("Before: Count: %d, success: %b, resultBuffer[0]: %x \r\n", count, success, resultBuffer[0]);
-#endif
+//    Serial.printf("Before: Count: %d, success: %b, resultBuffer[0]: %x \r\n", count, success, resultBuffer[0]);
     count++;
     send_NFC_PollReceive(command, sizeof(command));
     success = responseHasNoError();
-#ifdef DEBUGX
-    Serial.printf("After: Count: %d, success: %b, resultBuffer[0]: %x \r\n", count, success, resultBuffer[0]);
-#endif
+//    Serial.printf("After: Count: %d, success: %b, resultBuffer[0]: %x \r\n", count, success, resultBuffer[0]);
   } while ( !success && (count < maxTrials));
   delay(1);
-#ifdef DEBUGX
-  Serial.printf("Exiting at count: %d, resultBuffer[0]: %x \r\n", count, resultBuffer[0]);
-#endif
+//  Serial.printf("Exiting at count: %d, resultBuffer[0]: %x \r\n", count, resultBuffer[0]);
 }
+
 bool responseHasNoError()
 {
-#ifdef DEBUGX
-  Serial.printf("Response is resultBuffer[0]: %x, resultBuffer[2]: %x \r\n", resultBuffer[0], resultBuffer[2]);
-#endif
+//  Serial.printf("Response is resultBuffer[0]: %x, resultBuffer[2]: %x \r\n", resultBuffer[0], resultBuffer[2]);
   if (resultBuffer[0] == 0x80)
   {
     if ((resultBuffer[2] & 0x01) == 0)
@@ -823,22 +754,20 @@ SystemInformationDataType systemInformationDataFromGetSystemInformationResponse(
 
 void printSystemInformationData(SystemInformationDataType systemInformationData)
 {
-#ifdef DEBUG
   print_state("Printing system information data: ");
   Serial.printf("Result code: %x", systemInformationData.resultCode);
   Serial.printf(", Response flags: %x", systemInformationData.responseFlags);
-#ifdef DEBUGX
+/*
   Serial.printf("uid: %x", systemInformationData.uid[0]);
   for (int i = 1; i < 8; i++)
   {
     Serial.printf(":%x", systemInformationData.uid[i]);
   }
   Serial.println("");
-#endif
+*/
   Serial.print(", Sensor SN:");
   Serial.print(systemInformationData.sensorSN);
   Serial.printf(", Error code: %x", systemInformationData.errorCode);
-#endif
 }
 
 void clearBuffer(byte *tmpBuffer)
@@ -858,14 +787,10 @@ bool readSensorData()
   for (int i = 0; i < 43; i++)
   {
     resultCode = ReadSingleBlockReturn(i);
-#ifdef DEBUGX
-    printf("resultCode 0x%x - ", resultCode);
-#endif
+//    printf("resultCode 0x%x - ", resultCode);
     if (resultCode != 0x80 && trials < maxTrials)
     {
-#ifdef DEBUGX
-      printf("Error 0x%x\n\r", resultCode);
-#endif
+//      printf("Error 0x%x\n\r", resultCode);
       i--;        // repeat same block if error occured, but
       trials++;   // not more than maxTrials times per block
     }
@@ -879,21 +804,17 @@ bool readSensorData()
       for (int j = 3; j < resultBuffer[1] + 3 - 4; j++)
       {
         dataBuffer[i * 8 + j - 3] = resultBuffer[j];
-#ifdef DEBUGX
-        Serial.print(resultBuffer[j], HEX);
-        Serial.print(" ");
-#endif
+//        Serial.print(resultBuffer[j], HEX);
+//        Serial.print(" ");
       }
-#ifdef DEBUGX
-      Serial.println(" ");
-#endif
+//      Serial.println(" ");
     }
   }
   bool resultH = checkCRC16(dataBuffer, 0);
   bool resultB = checkCRC16(dataBuffer, 1);
   bool resultF = checkCRC16(dataBuffer, 2);
   bool crcResult = false;
-#ifdef DEBUGX
+
   Serial.println();
   Serial.print(" CRC-H check = ");
   Serial.println(resultH);
@@ -901,13 +822,11 @@ bool readSensorData()
   Serial.println(resultB);
   Serial.print(" CRC-F check = ");
   Serial.println(resultF);
-#endif
+
   if (resultH && resultB && resultF) crcResult = true;
   else crcResult = false;
-#ifdef DEBUG
   Serial.print("CRC check ");
   Serial.print(crcResult);
-#endif
   if (crcResult) NFCReady = 2;
   else NFCReady = 1;
   return crcResult;
@@ -926,7 +845,7 @@ byte ReadSingleBlockReturn(int blockNum)
   poll_NFC_UntilResponsIsReady();
   receive_NFC_Response();
   delay(1);
-#ifdef DEBUGX
+/*
   if (resultBuffer[0] == 128)
   {
 
@@ -945,7 +864,7 @@ byte ReadSingleBlockReturn(int blockNum)
     Serial.println(resultBuffer[0], HEX);
   }
   Serial.println(" ");
-#endif
+*/
   return resultBuffer[0];
 }
 //============================================================================================================
@@ -1003,26 +922,22 @@ void forLimiTTer()
   TxBuffer1 = "";
   TxBuffer1 += String(sensorData.trend[0] * 100);
   TxBuffer1 += " ";
-  TxBuffer1 += String(rfduinoData.voltage);
+  TxBuffer1 += String(SoCData.voltage);
   TxBuffer1 += " ";
-  TxBuffer1 += String(rfduinoData.voltagePercent);
+  TxBuffer1 += String(SoCData.voltagePercent);
   TxBuffer1 += " ";
   TxBuffer1 += String((int)(sensorData.minutesSinceStart / 10));
   int  LL = TxBuffer1.length();
-#ifdef DEBUG
   Serial.print("for LimiTTer >>");
   Serial.print(TxBuffer1);
   Serial.print("<< ");
   Serial.println(LL);
-#endif
+#ifdef RFD
   RFduinoBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
 #else
-  /*
-    settings.dex_tx_id = 0;
-    delay(2000);
-    sendBeacon();
-    waitDoingServices(2000, 1);
-  */
+  SimbleeBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
+#endif
+#else /* T2 */
   boolean resend_pkt = 0;
   while ((Pkts.read != Pkts.write) && BTconnected && ((millis() - pkt_time) < ((DXQUEUESIZE + 1) * 5000) )) {
     got_ack = 0;
@@ -1067,19 +982,21 @@ void forTransmiter1()
   TxBuffer1 = "";
   TxBuffer1 += String(sensorData.trend[0] * 100);
   TxBuffer1 += " ";
-  TxBuffer1 += String(rfduinoData.voltage);
+  TxBuffer1 += String(SoCData.voltage);
   TxBuffer1 += " ";
-  TxBuffer1 += String(rfduinoData.voltagePercent);
+  TxBuffer1 += String(SoCData.voltagePercent);
   TxBuffer1 += " ";
-  TxBuffer1 += String((int)(rfduinoData.temperatureC * 10));
+  TxBuffer1 += String((int)(SoCData.temperatureC * 10));
   int  LL = TxBuffer1.length();
-#ifdef DEBUG
   Serial.print("for Transmiter 1 >>");
   Serial.print(TxBuffer1);
   Serial.print("<< ");
   Serial.println(LL);
-#endif
+#ifdef RFD
   RFduinoBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
+#else
+  SimbleeBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
+#endif
 }
 
 void forTransmiter2()
@@ -1092,10 +1009,10 @@ void forTransmiter2()
   // all trend, all history
   allHardware +=  String(systemInformationData.resultCode) + " ";
   allHardware +=  String(systemInformationData.responseFlags) + " ";
-  allHardware +=  String(rfduinoData.voltage) + " ";
-  allHardware +=  String(rfduinoData.voltagePercent) + " ";
-  allHardware +=  String((int)(rfduinoData.temperatureC * 10)) + " ";
-  allHardware +=  String((int)(rfduinoData.rssi)) + " ";
+  allHardware +=  String(SoCData.voltage) + " ";
+  allHardware +=  String(SoCData.voltagePercent) + " ";
+  allHardware +=  String((int)(SoCData.temperatureC * 10)) + " ";
+  allHardware +=  String((int)(SoCData.rssi)) + " ";
   int  LLh = allHardware.length();
   allData += sensorData.sensorSN + " ";
   allData += String(sensorData.sensorStatusByte) + " ";
@@ -1104,7 +1021,6 @@ void forTransmiter2()
   for (int i = 0; i < 16; i++) allData += String(sensorData.trend[i]) + " ";
   for (int i = 0; i < 32; i++) allData += String(sensorData.history[i]) + " ";
   int  LLd = allData.length();
-#ifdef DEBUG
   Serial.println("for Transmiter 2 - Hardware data");
   Serial.print(">>");
   Serial.print(allHardware);
@@ -1115,7 +1031,6 @@ void forTransmiter2()
   Serial.print(allData);
   Serial.print("<< ");
   Serial.println(LLd);
-#endif
   String toTransfer = "M " + allHardware + " " + allData + " M";
   int lengthToTransfer = toTransfer.length();
   byte toCRC[lengthToTransfer];
@@ -1127,28 +1042,26 @@ void forTransmiter2()
   {
     TxBuffer1 = "";
     TxBuffer1 = toTransfer.substring(20 * i, 20 * (i + 1));
+#ifdef RFD
     RFduinoBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
-#ifdef DEBUG
+#else
+    RFduinoBLE.send(TxBuffer1.cstr(), TxBuffer1.length());
+#endif
     Serial.print("B-");
     Serial.print(i);
     Serial.print(" >>");
     Serial.print(TxBuffer1);
     Serial.println("<<");
-#endif
   }
 }
 
 void forLibreCGM()
 {
-#ifdef DEBUGM
   Serial.println("Start BT transmission ...");
   Serial.printf("IDN Sizeof ist : %d\n", sizeof(systemInformationData));
-#endif
   bool ergo = pumpViaBluetooth(SYSTEM_INFORMATION_DATA, UBP_TxFlagIsRPC, (char *) &systemInformationData, sizeof(SystemInformationDataType));
   printSystemInformationData(systemInformationData);
-#ifdef DEBUGM
   Serial.println("----about to send all data bytes packet");
-#endif
   for (int i = 0; i < sizeof(allBytes.allBytes); i++)
   {
     allBytes.allBytes[i] = 0;
@@ -1157,37 +1070,29 @@ void forLibreCGM()
   {
     allBytes.allBytes[i] = dataBuffer[i];
   }
-#ifdef DEBUGM
   Serial.printf("All data Sizeof ist : %d\n", sizeof(allBytes));
-#endif
   bool success = UBP_queuePacketTransmission(ALL_BYTES, UBP_TxFlagIsRPC, (char *) &allBytes, sizeof(AllBytesDataType));
-#ifdef DEBUGM
   if (success) Serial.println("----all data bytes packet queued successfully");
   else Serial.println("----Failed to enqueue all data bytes packet");
-#endif
   while (UBP_isBusy() == true) UBP_pump();
-  batteryData.voltage = (float) rfduinoData.voltage;
+  batteryData.voltage = (float) SoCData.voltage;
+#ifdef RFD
   batteryData.temperature = RFduino_temperature(CELSIUS);
-#ifdef DEBUGM
+#else
+  batteryData.temperature = Simblee_temperature(CELSIUS);
+#endif
   Serial.printf("Battery voltage: %f\r\n", batteryData.voltage);
   Serial.printf("Bat Sizeof ist : %d\n", sizeof(batteryData));
-#endif
   success = UBP_queuePacketTransmission(BATTERY_DATA, UBP_TxFlagIsRPC, (char *) &batteryData, sizeof(BatteryDataType));
-#ifdef DEBUGM
   if (success) Serial.println("Battery data packet queued successfully");
   else Serial.println("Failed to enqueue battery data packet");
-#endif
   while (UBP_isBusy() == true) UBP_pump();
-#ifdef DEBUGM
   Serial.printf("Sent Battery voltage: %f\r\n", batteryData.voltage);
-#endif
   ergo = pumpViaBluetooth(IDN_DATA, UBP_TxFlagNone, (char *) &idnData, sizeof(IDNDataType));
   success = UBP_queuePacketTransmission(IDN_DATA, UBP_TxFlagIsRPC, (char *) &idnData, sizeof(IDNDataType));
   delay(10);
-#ifdef DEBUGM
   if (success) Serial.println("IDN data packet queued successfully");
   else Serial.println("Failed to enqueue IDN data packet");
-#endif
   while (UBP_isBusy() == true) UBP_pump();
 }
 
@@ -1221,32 +1126,38 @@ void restartWDT()
 }
 */
   //================== end change by Bert Roode
-void RfduinoData()
+void SoC_Data()
 {
-  print_state("RfduinoData(): ");
+  print_state("SoC_Data(): ");
 
   analogReference(VBG);
   analogSelection(VDD_1_3_PS);
   int sensorValue = analogRead(1);
-  rfduinoData.voltage = sensorValue * (360 / 1023.0) * 10;
-  rfduinoData.voltagePercent = map(rfduinoData.voltage, MIN_VOLTAGE, MAX_VOLTAGE, 0, 100);
-  rfduinoData.temperatureC = RFduino_temperature(CELSIUS);
-  rfduinoData.temperatureF = RFduino_temperature(FAHRENHEIT);
-  if (rfduinoData.voltage < 2400) BatteryOK = false;
+
+  Serial.print("raw analog Vin : "); Serial.print(sensorValue);
+  
+  SoCData.voltage = sensorValue * (360 / 1023.0) * 10;
+  SoCData.voltagePercent = map(SoCData.voltage, MIN_VOLTAGE, MAX_VOLTAGE, 0, 100);
+#ifdef RFD
+  SoCData.temperatureC = RFduino_temperature(CELSIUS);
+  SoCData.temperatureF = RFduino_temperature(FAHRENHEIT);
+#else
+  SoCData.temperatureC = Simblee_temperature(CELSIUS);
+  SoCData.temperatureF = Simblee_temperature(FAHRENHEIT);
+#endif
+  if (SoCData.voltage < 2400) BatteryOK = false;
   else BatteryOK = true;
 
-#ifdef DEBUGM
   Serial.print(" - U[mv]: ");
-  Serial.print(rfduinoData.voltage);
+  Serial.print(SoCData.voltage);
   Serial.print(" - U[%]: ");
-  Serial.print(rfduinoData.voltagePercent);
+  Serial.print(SoCData.voltagePercent);
   Serial.print(" - Temp[C]: ");
-  Serial.print(rfduinoData.temperatureC);
+  Serial.print(SoCData.temperatureC);
   Serial.print(" - Temp[F]: ");
-  Serial.print(rfduinoData.temperatureF);
+  Serial.print(SoCData.temperatureF);
   Serial.print(" - RSSI: ");
-  Serial.print(rfduinoData.rssi);
-#endif
+  Serial.print(SoCData.rssi);
 }
 
 void readAllData()
@@ -1268,7 +1179,7 @@ void readAllData()
     decodeSensor();
   else
     print_state("no sensor data received");
-  RfduinoData();
+  SoC_Data();
   sendNFC_ToHibernate();
 }
 
@@ -1279,7 +1190,6 @@ void setupInitData()
   {
     protocolType = p->protocolType;
     runPeriod = p->runPeriod;
-#ifdef DEBUG
     Serial.print("Init data present at page ");
     Serial.print(MY_FLASH_PAGE);
     Serial.print(",  protocolType = ");
@@ -1288,7 +1198,6 @@ void setupInitData()
     Serial.print(p->runPeriod);
     Serial.print(",  firmware = ");
     Serial.print(p->firmware);
-#endif
   }
   else
   {
@@ -1304,7 +1213,6 @@ void setupInitData()
     writeData();
     protocolType = p->protocolType;
     runPeriod = p->runPeriod;
-#ifdef DEBUG
     Serial.print("New init data stored at page ");
     Serial.print(MY_FLASH_PAGE);
     Serial.print(",  protocolType = ");
@@ -1313,7 +1221,6 @@ void setupInitData()
     Serial.print(p->runPeriod, HEX);
     Serial.print(",  firmware = ");
     Serial.println(p->firmware, HEX);
-#endif
   }
 }
 
@@ -1321,19 +1228,15 @@ void eraseData()
 {
   print_state("eraseData() - ");
   int rc;
-#ifdef DEBUGM
   Serial.print("Attempting to erase flash page ");
   Serial.print(MY_FLASH_PAGE);
-#endif
   rc = flashPageErase(PAGE_FROM_ADDRESS(p));
-#ifdef DEBUGM
   if (rc == 0)
     Serial.println(" -> Success");
   else if (rc == 1)
     Serial.println(" -> Error - the flash page is reserved");
   else if (rc == 2)
     Serial.println(" -> Error - the flash page is used by the sketch");
-#endif
 }
 
 void writeData()
@@ -1342,25 +1245,20 @@ void writeData()
 
   print_state("writeData() - ");
 
-#ifdef DEBUGM
   Serial.print("Attempting to write data to flash page ");
   Serial.print(MY_FLASH_PAGE);
-#endif
   valueSetup.marker = 'T';
   rc = flashWriteBlock(p, &valueSetup, sizeof(valueSetup));
-#ifdef DEBUG
   if (rc == 0)
     Serial.println(" -> Success");
   else if (rc == 1)
     Serial.println(" -> Error - the flash page is reserved");
   else if (rc == 2)
     Serial.println(" -> Error - the flash page is used by the sketch");
-#endif
 }
 
 void displayData()
 {
-#ifdef DEBUGM
   Serial.print("The data stored in flash page ");
   Serial.print(MY_FLASH_PAGE);
   Serial.println(" contains: ");
@@ -1370,9 +1268,13 @@ void displayData()
   Serial.println(p->runPeriod);
   Serial.print("  firmware = ");
   Serial.println(p->firmware, HEX);
-#endif
 }
 
+/*
+ * handling of BLE transfer, incoming and outgoing data
+ */
+
+// BLE char buffer status
 boolean bleCharAvailable(void)
 {
   if ( bleBufRi == bleBufWi )
@@ -1381,23 +1283,21 @@ boolean bleCharAvailable(void)
     return (1);
 }
 
+// read one char form BLE incoming buffer
 unsigned char bleBufRead(void)
 {
   unsigned char ret = 0xFF;
 
-  if ( bleBufRi != bleBufWi )
-  {
+  if ( bleBufRi != bleBufWi ) {
     ret = bleBuf[bleBufRi++];
-
-    Serial.print(ret, HEX);
-    Serial.print(" ");
-
+    Serial.print(ret, HEX); Serial.print(" ");
     if ( bleBufRi >= BLEBUFLEN )
       bleBufRi = 0;
   }
   return (ret);
 }
 
+// write char into BEL char buffer, called from IRQ
 void bleBufWrite(unsigned char c)
 {
   bleBuf[bleBufWi++] = c;
@@ -1406,96 +1306,32 @@ void bleBufWrite(unsigned char c)
 //  Serial.print(c, HEX);
 }
 
+#ifdef RFD
 void RFduinoBLE_onReceive(char *data, int len)
 {
-  //  Serial.print("\r\n - RFduinoBLE_onReceive()\r\n");
-  /*
-    int i;
-    for ( i = 0 ; i < len ; i++ ) {
-      Serial.print(data[i], HEX);
-      Serial.print(" ");
-    }
-  */
   int i;
   for ( i = 0 ; i < len ; i++ )
     bleBufWrite(data[i]);
-  //  memcpy(bleBuf, data, len);
-  //  bleBufLen = len;
-  /*
-    if (data[0] == 'V')
-    {
-      String v = "v ";
-      v += String(p->protocolType) + " ";
-      v += String(p->runPeriod) + " ";
-      v += String(p->firmware, HEX) + " v";
-      #ifdef DEBUG
-        Serial.println("V-command received.");
-        Serial.println(v);
-      #endif
-      RFduinoBLE.send(v.cstr(), v.length());
-      displayData();
-    }
-    else if (data[0] == 'M')
-    {
-      valueSetup.protocolType = (byte) (data[1]- '0');
-      valueSetup.runPeriod = (byte) (data[2]- '0');
-      valueSetup.firmware = p->firmware;
-      #ifdef DEBUG
-        Serial.println("M-command received.");
-      #endif
-      while(!RFduinoBLE.radioActive){}
-      delay(6);
-      eraseData();
-      writeData();
-      displayData();
-      protocolType = p->protocolType;
-      runPeriod = p->runPeriod;
-    }
-    else if (data[0] == 'R')
-    {
-      #ifdef DEBUG
-        Serial.println("R-command received.");
-      #endif
-      readAllData();
-      dataTransferBLE();
-    }
-    else
-    {
-      #ifdef DEBUG
-        Serial.println("Wrong command received.");
-      #endif
-    }
-  */
 }
 
 void RFduinoBLE_onDisconnect()
 {
   BTconnected = false;
-
   print_state("+++++++++++++ BLE lost");
-
-#ifdef DEBUG
-  //      Serial.println("BT disconnected.");
-#endif
   _UBP_hostDisconnected();
 }
 
 void RFduinoBLE_onConnect()
 {
   BTconnected = true;
-
   print_state("+++++++++++++ BLE conn");
-
-#ifdef DEBUG
-  //      Serial.println("BT connected.");
-#endif
   hostIsConnected = true;
   if (UBP_didConnect) UBP_didConnect();
 }
 
 void RFduinoBLE_onRSSI(int rssi)
 {
-  rfduinoData.rssi = rssi;
+  SoCData.rssi = rssi;
 }
 
 void RFduinoBLE_onAdvertisement(bool start) {
@@ -1506,6 +1342,43 @@ bool BLEconnected()
 {
   return hostIsConnected;
 }
+#else /* RFD */
+void SimbleeBLE_onReceive(char *data, int len)
+{
+  int i;
+  for ( i = 0 ; i < len ; i++ )
+    bleBufWrite(data[i]);
+}
+
+void SimbleeBLE_onDisconnect()
+{
+  BTconnected = false;
+  print_state("+++++++++++++ BLE lost");
+  _UBP_hostDisconnected();
+}
+
+void SimbleeBLE_onConnect()
+{
+  BTconnected = true;
+  print_state("+++++++++++++ BLE conn");
+  hostIsConnected = true;
+  if (UBP_didConnect) UBP_didConnect();
+}
+
+void SimbleeBLE_onRSSI(int rssi)
+{
+  SoCData.rssi = rssi;
+}
+
+void SimbleeBLE_onAdvertisement(bool start) {
+  if (UBP_didAdvertise) UBP_didAdvertise(start);
+}
+
+bool BLEconnected()
+{
+  return hostIsConnected;
+}
+#endif /* RFD */
 
 /* ************ RFDuino ********************* */
 
@@ -1566,10 +1439,15 @@ void _UBP_pumpTxQueue() {
         Serial.printf("Buffer length is %d and i = %d\n", nextByteToSend, nextByteToSend);
 #endif
 
+#ifdef RFD
         while ( RFduinoBLE.send(nextByteToSend, TX_CHUNK_SIZE) == false && hostIsConnected && retryRemainingCount > 0) {
-
           retryRemainingCount--;
         };  // send() returns false if all tx buffers in use (can't enqueue, try again later)
+#else
+        while ( Simblee.send(nextByteToSend, TX_CHUNK_SIZE) == false && hostIsConnected && retryRemainingCount > 0) {
+          retryRemainingCount--;
+        };  // send() returns false if all tx buffers in use (can't enqueue, try again later)
+#endif          
 
         //                delay(20); // 2016-07-12: try to get fewer transfer errors using a small delay
 #ifdef DEBUG
@@ -1580,12 +1458,15 @@ void _UBP_pumpTxQueue() {
       } else {  // Only partial TX buffer remaining to send
 
         // Send is queued (the ble stack delays send to the start of the next tx window)
-
+#ifdef RFD
         while ( RFduinoBLE.send(nextByteToSend, remainingByteCount) == false && hostIsConnected && retryRemainingCount > 0) {
-
           retryRemainingCount--;
         };  // send() returns false if all tx buffers in use (can't enqueue, try again later)
-
+#else
+        while ( SimbleeBLE.send(nextByteToSend, remainingByteCount) == false && hostIsConnected && retryRemainingCount > 0) {
+          retryRemainingCount--;
+        };  // send() returns false if all tx buffers in use (can't enqueue, try again later)
+#endif
         ubpTxBufferSentByteCount += remainingByteCount;
 
         //                delay(20); // 2016-07-12: try to get fewer transfer errors using a small delay
@@ -1982,10 +1863,10 @@ void show_4_bytes(byte *buf)
 
 void decodeSensorBody()
 {
-  print_state("decodeSensorBody() - ");
+//  print_state("decodeSensorBody() - ");
 
   int i;
-  Serial.println("");
+//  Serial.println("");
 /*
   for ( i = 0 ; i < (320-24) ; i++) {
     if ( (i%8) == 0 )
@@ -2033,18 +1914,18 @@ void decodeSensorBody()
 */
   sensorData.nextTrend = sensorDataBody[2];
   sensorData.nextHistory = sensorDataBody[3];
-  print_state("next trend block / next history block: "); Serial.printf("%d %d", sensorData.nextTrend, sensorData.nextHistory);
+//  print_state("next trend block / next history block: "); Serial.printf("%d %d", sensorData.nextTrend, sensorData.nextHistory);
   
   byte minut[2];
   minut[0] = sensorDataBody[293];
   minut[1] = sensorDataBody[292];
 
-  print_state("Sensor minutes: "); Serial.printf("%x %x", minut[0], minut[1]);
+//  print_state("Sensor minutes: "); Serial.printf("%x %x", minut[0], minut[1]);
 
   sensorData.minutesSinceStart = minut[0] * 256 + minut[1];
   sensorData.minutesHistoryOffset = (sensorData.minutesSinceStart - 3) % 15 + 3 ;
 
-  print_state("Sensor minutes : "); Serial.print(sensorData.minutesSinceStart);
+//  print_state("Sensor minutes : "); Serial.print(sensorData.minutesSinceStart);
   Serial.print(", minutes history offset: "); Serial.print(sensorData.minutesHistoryOffset);
 
   int index = 0;
@@ -2108,7 +1989,6 @@ void decodeSensorFooter()
 
 void displaySensorData()
 {
-#ifdef DEBUGM
   if (!sensorData.sensorDataOK) 
     print_state("Sensor data error");
   else
@@ -2135,7 +2015,6 @@ void displaySensorData()
     }
     //      Serial.println("");
   }
-#endif
 }
 
 
@@ -2335,8 +2214,11 @@ void send_data(unsigned char *msg, unsigned char len)
 
   last_ble_send_time = millis();
   crlf_printed = 0;
-
+#ifdef RFD
   RFduinoBLE.send((char *)msg, len);
+#else
+  SimbleeBLE.send((char *)msg, len);
+#endif
   delay(100);
 
   print_state("sending: <");
@@ -2363,7 +2245,11 @@ int send_ble_string(String cmd, boolean connect_state)
 
       last_ble_send_time = millis();
       crlf_printed = 0;
+#ifdef RFD
       RFduinoBLE.send(cmd.cstr(), strlen(cmd.cstr()));
+#else
+      SimbleeBLE.send(cmd.cstr(), strlen(cmd.cstr()));
+#endif
       //      ble_Serial.print(cmd);
 
       now = millis();
@@ -2391,7 +2277,11 @@ void send_string(String cmd, int dly)
   last_ble_send_time = millis();
   crlf_printed = 0;
   //  ble_Serial.print(cmd);
+#ifdef RFD
   RFduinoBLE.send(cmd.cstr(), strlen(cmd.cstr()));
+#else
+  SimbleeBLE.send(cmd.cstr(), strlen(cmd.cstr()));
+#endif
   if ( show_ble ) {
     print_state(" ->(");
     Serial.print(cmd);
@@ -2679,7 +2569,8 @@ void waitDoingServices(unsigned long wait_time, unsigned char bProtocolServices)
 int get_packet(Dexcom_packet* pPkt, int actGlucose)
 {
   print_state("get_packet() - ");
-  pPkt->raw = actGlucose * 100;
+//  pPkt->raw = actGlucose * 100;
+  pPkt->raw = (actGlucose/8.5)*1000;
   pPkt->ms = millis();
   pkt_time = pPkt->ms;
   Serial.print("packet read at ");
@@ -2715,7 +2606,7 @@ int print_packet(Dexcom_packet* pPkt)
   msg.raw = pPkt->raw;
   msg.filtered = pPkt->raw;
   msg.dex_battery = 214;  // simulate good dexcom transmitter battery
-  msg.my_battery = rfduinoData.voltagePercent;
+  msg.my_battery = SoCData.voltagePercent;
   msg.dex_src_id = settings.dex_tx_id;
   msg.delay = millis() - pPkt->ms;
   msg.function = DEXBRIDGE_PROTO_LEVEL; // basic functionality, data packet (with ack), TXID packet, beacon packet (also TXID ack).
